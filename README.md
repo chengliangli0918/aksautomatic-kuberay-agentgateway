@@ -3,6 +3,13 @@
 Deploys a **public** OpenAI-compatible HTTPS inference API with per-caller
 authentication, request limits, daily token quotas, and daily chargeback budgets.
 
+It serves three models with **smart routing**: callers send `"model": "auto"`,
+and the quota proxy picks a model for each request before charging quota.
+Images go to Qwen3.5-4B. For text, a small CPU decision model, the **smart
+router**, sends coding and math prompts to gpt-oss-120b and simple prompts to
+the cheaper gpt-oss-20b. Callers can also choose a model by name. See
+[Model routing](#model-routing).
+
 ![POC architecture: callers reach agentgateway over public HTTPS; the quota proxy enforces per-caller limits and picks a model with a CPU model router before Ray Serve routes requests to three models on one 8xA100 node](docs/architecture.svg)
 
 A 2560×1440 PNG for slides is in [`docs/architecture.png`](docs/architecture.png).
