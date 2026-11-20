@@ -15,6 +15,7 @@ import (
 	_ "image/png"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -298,6 +299,7 @@ type service struct {
 	proxy    *httputil.ReverseProxy
 	now      func() time.Time
 	decoding chan struct{}
+	audit    *slog.Logger
 }
 
 func newService(db *sql.DB, callers map[string]caller, upstream *url.URL) *service {
@@ -308,6 +310,14 @@ func newService(db *sql.DB, callers map[string]caller, upstream *url.URL) *servi
 			r.Out.Header = make(http.Header)
 			r.Out.Header.Set("Content-Type", "application/json")
 			r.Out.Header.Set("Accept", r.In.Header.Get("Accept"))
+			if a, ok := r.In.Context().Value(auditContextKey{}).(*callAudit); ok {
+				r.Out.Header.Set("X-Request-ID", a.RequestID)
+			}
+		},
+		ModifyResponse: func(r *http.Response) error {
+			// Keep the proxy-generated correlation ID on the client response.
+			r.Header.Del("X-Request-ID")
+			return nil
 		},
 		Transport: &http.Transport{
 			Proxy:                 nil,
@@ -320,7 +330,10 @@ func newService(db *sql.DB, callers map[string]caller, upstream *url.URL) *servi
 			reject(w, http.StatusBadGateway, "inference backend unavailable; reservation retained")
 		},
 	}
-	return &service{db: db, callers: callers, proxy: proxy, now: time.Now, decoding: make(chan struct{}, decodeSlots)}
+	return &service{
+		db: db, callers: callers, proxy: proxy, now: time.Now, decoding: make(chan struct{}, decodeSlots),
+		audit: slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+	}
 }
 
 func reject(w http.ResponseWriter, status int, reason string) {
@@ -343,6 +356,13 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	start := time.Now()
+	a := newCallAudit(r, s.now())
+	r = r.WithContext(context.WithValue(r.Context(), auditContextKey{}, a))
+	aw := &auditWriter{ResponseWriter: w}
+	w = aw
+	w.Header().Set("X-Request-ID", a.RequestID)
+	defer s.finishAudit(r, aw, a, start)
 	auth := r.Header.Get("Authorization")
 	if !strings.HasPrefix(auth, "Bearer ") {
 		reject(w, http.StatusUnauthorized, "Bearer API key required")
@@ -354,12 +374,18 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reject(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
+	a.CallerID, a.TokenPriceMicrousd = c.ID, c.TokenPriceMicrousd
 	if r.URL.RawQuery != "" {
 		reject(w, http.StatusBadRequest, "query parameters are not supported")
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+		a.Outcome = "forwarding"
 		s.proxy.ServeHTTP(w, r)
+		a.Outcome = "completed"
+		if aw.status >= 400 {
+			a.Outcome = "upstream_error"
+		}
 		return
 	}
 	if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" {
@@ -373,18 +399,29 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := reserve(r.Context(), s.db, c, s.now()); err != nil {
 		if errors.Is(err, errQuota) {
+			a.Outcome = "quota_exceeded"
 			reject(w, http.StatusTooManyRequests, "request, daily token, or daily chargeback budget exceeded")
 		} else {
+			a.Outcome = "ledger_error"
 			log.Printf("quota reservation failed: %v", err)
 			reject(w, http.StatusServiceUnavailable, "quota ledger unavailable")
 		}
 		return
 	}
+	a.ReservedTokens = contextTokens
+	a.ChargeMicrousd = contextTokens * c.TokenPriceMicrousd
+	a.Outcome = "admitted"
+	s.audit.InfoContext(r.Context(), "inference_admitted", "call", a)
 	r.Body = newPayloadBody(payload)
 	r.ContentLength = int64(len(payload))
 	w.Header().Set("X-Quota-Reserved-Tokens", fmt.Sprint(contextTokens))
 	w.Header().Set("X-Quota-Reserved-Microusd", fmt.Sprint(contextTokens*c.TokenPriceMicrousd))
+	a.Outcome = "forwarding"
 	s.proxy.ServeHTTP(w, r)
+	a.Outcome = "completed"
+	if aw.status >= 400 {
+		a.Outcome = "upstream_error"
+	}
 }
 
 // readChat decodes and validates a chat request and returns the payload to forward, or an
@@ -413,6 +450,9 @@ func (s *service) readChat(w http.ResponseWriter, r *http.Request) ([]byte, int,
 	}
 	if err := checkMessages(body.Messages); err != nil {
 		return nil, http.StatusBadRequest, err.Error()
+	}
+	if a, ok := r.Context().Value(auditContextKey{}).(*callAudit); ok {
+		a.setRequest(body)
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {

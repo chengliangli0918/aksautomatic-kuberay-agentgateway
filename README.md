@@ -121,6 +121,44 @@ dashboard access for reconciliation.
 Privileged cluster administrators can bypass these controls; callers must not
 have Kubernetes exec/port-forward, Secret-read, or workload-edit privileges.
 
+### Per-call audit logs
+
+The **quota-proxy** writes structured JSON audit events to stdout, where both
+authenticated caller identity and committed charge are known. Health probes are
+excluded. Every other request gets a proxy-generated `X-Request-ID`, returned to
+the client and forwarded to Ray for correlation; client-supplied IDs are ignored.
+
+- `inference_admitted` is emitted immediately after a successful durable
+  reservation, before contacting Ray.
+- `inference_request` is emitted when handling ends, including rejected requests,
+  upstream errors, canceled requests, and interrupted streams.
+- The nested `call` object includes `request_id`, UTC `started_at`, `caller_id`
+  (only after authentication), endpoint, validated model, streaming flag, message
+  and image counts, text byte count, output limit, optional temperature, HTTP
+  status, response byte count, elapsed milliseconds, and outcome.
+- `reserved_tokens`, `token_price_microusd`, and `charge_microusd` record the
+  **actual application chargeback**: `8192 * token_price_microusd` for admitted
+  inference, zero for rejected requests and model listing. `cost_basis` is
+  `reserved_context_chargeback`. This is **not measured token usage or per-call
+  Azure infrastructure cost**. Failed calls retain their charge. Do not sum both
+  events: correlate/deduplicate by `request_id`.
+- Prompts, responses, images, API keys/digests, cookies, IP addresses, arbitrary
+  paths/query strings, and client-controlled headers are not included. Caller IDs
+  should be opaque identifiers, not personal data.
+
+Inspect with `kubectl logs -n inference deployment/quota-proxy`. A `completed`
+outcome means HTTP forwarding returned normally, not that generation or an SSE
+`[DONE]` marker was verified. HTTP status alone cannot identify broken streams.
+Admission events have status/response bytes/duration zero because forwarding has
+not begun.
+
+These are operational logs, **not an immutable durable audit store**. Export
+stdout through your cluster log collector to access-controlled storage with an
+appropriate retention policy. Abrupt process/node loss can omit completion
+events, and log delivery is not atomic with the SQLite reservation; the ledger
+remains the durable source of aggregate charges. No log collector or Azure
+resource is provisioned by this change.
+
 ## Public endpoint
 
 The API is served at `https://<hostname>/v1`. By default the hostname is the
