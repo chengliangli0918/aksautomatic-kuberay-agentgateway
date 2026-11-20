@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inference
+---
+# Excluded from AKS Deployment Safeguards (cert-manager's ACME solver pods have
+# no probes); Kubernetes restricted Pod Security is enforced instead.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: inference-edge
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+# Excluded from AKS Deployment Safeguards (cainjector/controller lack probes).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-manager
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+---
+# Excluded from AKS Deployment Safeguards and baseline Pod Security: the NVIDIA
+# device plugin needs hostPath volumes.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-system

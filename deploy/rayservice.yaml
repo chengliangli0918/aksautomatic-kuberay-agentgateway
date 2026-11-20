@@ -1,0 +1,133 @@
+apiVersion: ray.io/v1
+kind: RayService
+metadata:
+  name: vllm
+  namespace: inference
+spec:
+  serveConfigV2: |
+    proxy_location: HeadOnly
+    http_options:
+      host: 0.0.0.0
+      port: 8000
+    applications:
+      - name: llm
+        import_path: ray.serve.llm:build_openai_app
+        route_prefix: /
+        args:
+          llm_configs:
+            - model_loading_config:
+                model_id: qwen3.5-4b
+                model_source: Qwen/Qwen3.5-4B
+              engine_kwargs:
+                dtype: bfloat16
+                tensor_parallel_size: 1
+                max_model_len: 8192
+                gpu_memory_utilization: 0.85
+                trust_remote_code: false
+                # Images only (no video): at most 2 per request, each resized to at most
+                # 2,097,152 pixels (2,048 tokens) so they fit the 8,192-token context.
+                limit_mm_per_prompt:
+                  image: 2
+                  video: 0
+                mm_processor_kwargs:
+                  images_kwargs:
+                    size:
+                      longest_edge: 2097152
+                      shortest_edge: 65536
+                # quota-proxy forwards only inline data: images; never fetch media URLs.
+                allowed_media_domains: [media.invalid]
+                # Qwen3.5 thinks by default, which would use up the 512-token output limit.
+                default_chat_template_kwargs:
+                  enable_thinking: false
+                # The model card's non-thinking sampling settings, used when a request omits them.
+                override_generation_config:
+                  temperature: 0.7
+                  top_p: 0.8
+                  top_k: 20
+                  min_p: 0.0
+                  presence_penalty: 1.5
+                  repetition_penalty: 1.0
+              deployment_config:
+                autoscaling_config:
+                  min_replicas: 8
+                  max_replicas: 8
+                max_ongoing_requests: 32
+  rayClusterConfig:
+    rayVersion: "2.60.0"
+    enableInTreeAutoscaling: false
+    headGroupSpec:
+      serviceType: ClusterIP
+      rayStartParams:
+        dashboard-host: "0.0.0.0"
+        num-cpus: "2"
+        num-gpus: "0"
+      template:
+        metadata:
+          labels:
+            app: ray-inference
+        spec:
+          automountServiceAccountToken: false
+          nodeSelector:
+            kubernetes.io/arch: amd64
+          containers:
+            - name: ray-head
+              image: rayproject/ray-llm:2.60.0-py312-cu130
+              ports:
+                - {name: gcs, containerPort: 6379}
+                - {name: dashboard, containerPort: 8265}
+                - {name: client, containerPort: 10001}
+                - {name: serve, containerPort: 8000}
+              resources:
+                requests: {cpu: "4", memory: 8Gi}
+                limits: {cpu: "4", memory: 8Gi}
+    workerGroupSpecs:
+      - groupName: a100
+        replicas: 1
+        minReplicas: 1
+        maxReplicas: 1
+        rayStartParams:
+          num-cpus: "80"
+          num-gpus: "8"
+        template:
+          metadata:
+            labels:
+              app: ray-inference
+          spec:
+            automountServiceAccountToken: false
+            nodeSelector:
+              workload: inference-a100
+              karpenter.sh/nodepool: inference-a100
+              node.kubernetes.io/instance-type: Standard_ND96amsr_A100_v4
+            tolerations:
+              - key: dedicated
+                operator: Equal
+                value: inference-gpu
+                effect: NoSchedule
+              - key: nvidia.com/gpu
+                operator: Exists
+                effect: NoSchedule
+            containers:
+              - name: ray-worker
+                image: rayproject/ray-llm:2.60.0-py312-cu130
+                env:
+                  - name: HF_HOME
+                    value: /tmp/huggingface
+                resources:
+                  requests:
+                    cpu: "80"
+                    memory: 256Gi
+                    ephemeral-storage: 80Gi
+                    nvidia.com/gpu: "8"
+                  limits:
+                    cpu: "80"
+                    memory: 256Gi
+                    ephemeral-storage: 160Gi
+                    nvidia.com/gpu: "8"
+                volumeMounts:
+                  - name: shm
+                    mountPath: /dev/shm
+            volumes:
+              - name: shm
+                emptyDir:
+                  medium: Memory
+                  sizeLimit: 32Gi

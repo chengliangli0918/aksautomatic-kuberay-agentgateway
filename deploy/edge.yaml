@@ -1,0 +1,156 @@
+# Public HTTPS edge. Placeholders (__X__) are filled in by scripts/deploy.sh.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt
+  namespace: inference-edge
+spec:
+  acme:
+    server: __ACME_SERVER__
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - http01:
+          ingress:
+            # No ingress controller serves this class. agentgateway routes
+            # /.well-known/acme-challenge/ to the acme-http01-solver Service,
+            # which selects solver pods by the label below.
+            ingressClassName: agentgateway-acme
+            serviceType: ClusterIP
+            podTemplate:
+              metadata:
+                labels:
+                  app: acme-http01-solver
+              spec:
+                nodeSelector:
+                  kubernetes.io/os: linux
+                  kubernetes.io/arch: amd64
+                resources:
+                  requests: {cpu: 100m, memory: 100Mi}
+                  limits: {cpu: 100m, memory: 100Mi}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: agentgateway-tls
+  namespace: inference-edge
+spec:
+  # scripts/deploy.sh pre-creates this Secret with a self-signed bootstrap
+  # certificate so agentgateway can serve the first challenge. Its issuer
+  # annotation differs from this Issuer, so cert-manager reports Ready=False
+  # and keeps retrying until a trusted certificate replaces it. (cert-manager's
+  # issue-temporary-certificate annotation is not used: it treats its own
+  # temporary certificate as valid and stops retrying after a failed order.)
+  secretName: agentgateway-tls
+  dnsNames:
+    - __PUBLIC_HOSTNAME__
+  issuerRef:
+    name: letsencrypt
+    kind: Issuer
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: acme-http01-solver
+  namespace: inference-edge
+spec:
+  selector:
+    app: acme-http01-solver
+  ports:
+    - {name: http, port: 8089, targetPort: 8089}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentgateway
+  namespace: inference-edge
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: agentgateway
+  template:
+    metadata:
+      labels:
+        app: agentgateway
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: agentgateway
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agentgateway
+          image: ghcr.io/agentgateway/agentgateway:v1.7.0@sha256:60216aafb03d37f94e952ff3d51d2f630a65b10ecaebdc0a864882f92610c45b
+          args: ["-f", "/config/config.yaml"]
+          ports:
+            - {name: acme, containerPort: 8080}
+            - {name: https, containerPort: 8443}
+            - {name: health, containerPort: 15021}
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          readinessProbe:
+            httpGet: {path: /healthz/ready, port: health}
+          livenessProbe:
+            tcpSocket: {port: health}
+            initialDelaySeconds: 10
+          volumeMounts:
+            - {name: config, mountPath: /config, readOnly: true}
+            # Renewed certificates are reloaded in place; no restart is needed.
+            - {name: tls, mountPath: /tls, readOnly: true}
+      volumes:
+        - name: config
+          configMap:
+            name: agentgateway-config
+        - name: tls
+          secret:
+            secretName: agentgateway-tls
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agentgateway
+  namespace: inference-edge
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: agentgateway
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentgateway
+  namespace: inference-edge
+  annotations:
+    service.beta.kubernetes.io/azure-dns-label-name: __DNS_LABEL__
+spec:
+  type: LoadBalancer
+  # Preserves client source IPs for the per-IP rate limit.
+  externalTrafficPolicy: Local
+  selector:
+    app: agentgateway
+  ports:
+    - {name: http, port: 80, targetPort: acme}
+    - {name: https, port: 443, targetPort: https}

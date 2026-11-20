@@ -1,0 +1,52 @@
+# Public edge. Port 8443 serves the HTTPS API; port 8080 (public port 80)
+# serves only ACME HTTP-01 challenges and never forwards API traffic.
+gateways:
+  acme:
+    port: 8080
+    protocol: HTTP
+  inference:
+    port: 8443
+    protocol: HTTPS
+    tls:
+      cert: /tls/tls.crt
+      key: /tls/tls.key
+routes:
+  - name: acme-http01
+    gateways: [acme]
+    matches:
+      - path:
+          pathPrefix: /.well-known/acme-challenge/
+    policies:
+      # Hostname backends get their Host rewritten by default, but cert-manager's
+      # solver only answers requests whose Host is the certificate domain.
+      urlRewrite:
+        authority: none
+    backends:
+      - host: acme-http01-solver.inference-edge.svc.cluster.local:8089
+  - name: plaintext-rejected
+    gateways: [acme]
+    policies:
+      directResponse:
+        status: 400
+        body: "HTTPS is required.\n"
+  - name: inference
+    gateways: [inference]
+    matches:
+      - path:
+          pathPrefix: /v1/
+    policies:
+      # Per client IP and per gateway replica; caller quotas are enforced by quota-proxy.
+      localRateLimit:
+        - key: source.address
+          maxTokens: 120
+          tokensPerFill: 2
+          fillInterval: 1s
+          type: requests
+    backends:
+      - host: quota-proxy.inference.svc.cluster.local:8080
+  - name: not-found
+    gateways: [inference]
+    policies:
+      directResponse:
+        status: 404
+        body: "Not found.\n"

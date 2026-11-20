@@ -1,0 +1,58 @@
+apiVersion: karpenter.azure.com/v1beta1
+kind: AKSNodeClass
+metadata:
+  name: inference-a100
+spec:
+  imageFamily: Ubuntu
+  osDiskSizeGB: 512
+  gpu:
+    mode: Driver
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: inference-a100
+spec:
+  limits:
+    cpu: "96"
+    nvidia.com/gpu: "8"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 5m
+    budgets:
+      - nodes: "0"
+        reasons: [Drifted, Underutilized]
+      - nodes: "1"
+        reasons: [Empty]
+  template:
+    metadata:
+      labels:
+        workload: inference-a100
+        kubernetes.azure.com/ebpf-dataplane: cilium
+    spec:
+      nodeClassRef:
+        group: karpenter.azure.com
+        kind: AKSNodeClass
+        name: inference-a100
+      expireAfter: Never
+      taints:
+        - key: dedicated
+          value: inference-gpu
+          effect: NoSchedule
+      startupTaints:
+        - key: node.cilium.io/agent-not-ready
+          value: "true"
+          effect: NoExecute
+      requirements:
+        - key: karpenter.azure.com/sku-name
+          operator: In
+          values: [Standard_ND96amsr_A100_v4]
+        - key: kubernetes.io/os
+          operator: In
+          values: [linux]
+        - key: kubernetes.io/arch
+          operator: In
+          values: [amd64]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: [on-demand]

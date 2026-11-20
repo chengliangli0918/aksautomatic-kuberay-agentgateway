@@ -1,0 +1,7 @@
+[server]
+# The app spends the caller's quota, so only this machine may open it.
+address = "127.0.0.1"
+headless = true
+
+[browser]
+gatherUsageStats = false

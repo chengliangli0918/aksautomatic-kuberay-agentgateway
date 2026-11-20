@@ -1,0 +1,20 @@
+nodeSelector:
+  workload: inference-a100
+# Replaces the chart default, which requires Node Feature Discovery labels that
+# AKS does not set; AKS labels its NVIDIA GPU nodes with this key instead.
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.azure.com/accelerator
+              operator: In
+              values: [nvidia]
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: inference-gpu
+    effect: NoSchedule
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule

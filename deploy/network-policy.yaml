@@ -1,0 +1,53 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: quota-only-from-gateway
+  namespace: inference
+spec:
+  podSelector:
+    matchLabels:
+      app: quota-proxy
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: inference-edge
+          podSelector:
+            matchLabels:
+              app: agentgateway
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: isolate-ray
+  namespace: inference
+spec:
+  podSelector:
+    matchLabels:
+      app: ray-inference
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: ray-inference
+    - from:
+        - podSelector:
+            matchLabels:
+              app: quota-proxy
+      ports:
+        - {protocol: TCP, port: 8000}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kuberay-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kuberay-operator
+      # 8265: dashboard/Serve API; 8000: proxy health check that gates the serve endpoints.
+      ports:
+        - {protocol: TCP, port: 8265}
+        - {protocol: TCP, port: 8000}
