@@ -64,14 +64,15 @@ if ! jq -e --arg name "$ACR_NAME" 'any(.[]; .name == $name)' <<<"$registries" >/
 fi
 az aks update --resource-group "$RESOURCE_GROUP" --name "$CLUSTER_NAME" --attach-acr "$ACR_NAME"
 az acr build --registry "$ACR_NAME" --image "quota-proxy:$image_tag" --platform linux/amd64 .
+az acr build --registry "$ACR_NAME" --image "model-router:$image_tag" --platform linux/amd64 router
 
 # Do not overwrite or use a shared kubeconfig/current-context.
 work=$(mktemp -d)
 pf_pid=""
 cleanup() {
   if [[ -n "$pf_pid" ]]; then kill "$pf_pid" 2>/dev/null || true; fi
-  rm -f "$work/kubeconfig" "$work/quota-proxy.yaml" "$work/edge.yaml" "$work/bootstrap.crt" \
-    "$work/bootstrap.key" "$work/port-forward.log"
+  rm -f "$work/kubeconfig" "$work/quota-proxy.yaml" "$work/model-router.yaml" "$work/edge.yaml" \
+    "$work/bootstrap.crt" "$work/bootstrap.key" "$work/port-forward.log"
   rmdir "$work"
 }
 trap cleanup EXIT
@@ -175,6 +176,10 @@ kubectl -n inference create secret generic callers --from-file=callers.json="$CA
   --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f deploy/network-policy.yaml
 kubectl apply -f deploy/rayservice.yaml
+sed "s|image: model-router:local|image: $ACR_NAME.azurecr.io/model-router:$image_tag|" \
+  deploy/model-router.yaml > "$work/model-router.yaml"
+kubectl apply -f "$work/model-router.yaml"
+kubectl -n inference rollout status deployment/model-router --timeout=5m
 sed "s|image: quota-proxy:local|image: $image|" deploy/quota-proxy.yaml > "$work/quota-proxy.yaml"
 kubectl apply -f "$work/quota-proxy.yaml"
 kubectl -n inference rollout status deployment/quota-proxy --timeout=5m

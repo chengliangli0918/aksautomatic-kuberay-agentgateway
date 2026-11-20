@@ -13,8 +13,12 @@ spec:
       - name: llm
         import_path: ray.serve.llm:build_openai_app
         route_prefix: /
+        # Ray Serve routes by the request's model field. quota-proxy only forwards these IDs,
+        # and its catalog (cmd/quota-proxy/models.go) must match them, their max_model_len,
+        # and which model accepts images. The 8 replicas use all 8 GPUs, one each.
         args:
           llm_configs:
+            # The only vision model: quota-proxy routes every request with images here.
             - model_loading_config:
                 model_id: qwen3.5-4b
                 model_source: Qwen/Qwen3.5-4B
@@ -36,7 +40,7 @@ spec:
                       shortest_edge: 65536
                 # quota-proxy forwards only inline data: images; never fetch media URLs.
                 allowed_media_domains: [media.invalid]
-                # Qwen3.5 thinks by default, which would use up the 512-token output limit.
+                # Qwen3.5 thinks by default; image questions get direct answers instead.
                 default_chat_template_kwargs:
                   enable_thinking: false
                 # The model card's non-thinking sampling settings, used when a request omits them.
@@ -49,9 +53,43 @@ spec:
                   repetition_penalty: 1.0
               deployment_config:
                 autoscaling_config:
-                  min_replicas: 8
-                  max_replicas: 8
+                  min_replicas: 2
+                  max_replicas: 2
                 max_ongoing_requests: 32
+            # The cheap text model: quota-proxy routes simple "auto" prompts here.
+            - model_loading_config:
+                model_id: gpt-oss-20b
+                model_source: openai/gpt-oss-20b
+              engine_kwargs:
+                tensor_parallel_size: 1
+                max_model_len: 8192
+                gpu_memory_utilization: 0.85
+                trust_remote_code: false
+                # Returns the analysis channel as reasoning, separate from the answer.
+                reasoning_parser: openai_gptoss
+                allowed_media_domains: [media.invalid]
+              deployment_config:
+                autoscaling_config:
+                  min_replicas: 3
+                  max_replicas: 3
+                max_ongoing_requests: 32
+            # The strong text model: quota-proxy routes "auto" coding and math prompts here.
+            # Its MXFP4 weights load as 66 GiB, leaving one A100 80GB about 84k tokens of KV cache.
+            - model_loading_config:
+                model_id: gpt-oss-120b
+                model_source: openai/gpt-oss-120b
+              engine_kwargs:
+                tensor_parallel_size: 1
+                max_model_len: 8192
+                gpu_memory_utilization: 0.93
+                trust_remote_code: false
+                reasoning_parser: openai_gptoss
+                allowed_media_domains: [media.invalid]
+              deployment_config:
+                autoscaling_config:
+                  min_replicas: 3
+                  max_replicas: 3
+                max_ongoing_requests: 16
   rayClusterConfig:
     rayVersion: "2.60.0"
     enableInTreeAutoscaling: false

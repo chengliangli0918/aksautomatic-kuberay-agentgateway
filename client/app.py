@@ -18,10 +18,20 @@ import chat
 st.set_page_config(page_title="AgentGateway POC", page_icon="💬")
 # Indent replies a little and use a smaller font so they stand apart from the questions.
 REPLY = '[data-testid="stChatMessage"]:has([aria-label="Chat message from assistant"])'
+# The page header stays just below Streamlit's 3.75rem toolbar while the chat scrolls under
+# it, so it needs the page's own opaque background. Streamlit wraps the keyed container in a
+# layout wrapper of the same height, so the wrapper is what sticks.
+HEADER = ".st-key-chat_header"
+background = st.get_option("theme.backgroundColor") or ("#0e1117" if st.context.theme.type == "dark" else "#ffffff")
 st.html(
     f"<style>{REPLY} {{ margin-left: 2rem; width: calc(100% - 2rem); }}"
     f' {REPLY} [data-testid="stMarkdownContainer"] {{ font-size: 0.875rem; }}'
     f' {REPLY} [data-testid="stCode"] code, {REPLY} [data-testid="stCaptionContainer"] {{ font-size: 0.75rem; }}'
+    ' [data-testid="stMainBlockContainer"] { padding-top: 3.75rem; }'
+    f' [data-testid="stLayoutWrapper"]:has(> {HEADER}), {HEADER}'
+    f" {{ position: sticky; top: 3.75rem; z-index: 100; background: {background}; }}"
+    f" {HEADER} {{ padding: 0.5rem 0; border-bottom: 1px solid rgba(128, 128, 128, 0.25); }}"
+    f" {HEADER} h1 {{ font-size: 1.5rem; padding-top: 0; }}"
     "</style>"
 )
 st.session_state.setdefault("messages", [])
@@ -56,6 +66,7 @@ def environment_api_key() -> str:
 def stream_reply(client: openai.OpenAI, request: dict, state: dict):
     with client.chat.completions.create(**request, stream=True) as stream:
         state["reservation"] = chat.reservation(stream.response.headers)
+        state["route"] = chat.route(stream.response.headers)
         for chunk in stream:
             text = chunk.choices[0].delta.content if chunk.choices else None
             if text:
@@ -63,8 +74,14 @@ def stream_reply(client: openai.OpenAI, request: dict, state: dict):
                 yield text
 
 
-def reservation_text(tokens: int, microusd: int) -> str:
-    return f"Reserved {tokens:,} tokens · ${microusd / 1_000_000:,.4f} chargeback"
+def reply_caption(reservation: tuple[int, int] | None, route: str | None) -> str:
+    parts = []
+    if reservation:
+        tokens, microusd = reservation
+        parts.append(f"Reserved {tokens:,} tokens · ${microusd / 1_000_000:,.4f} chargeback")
+    if route:
+        parts.append(f"Model: {route}")
+    return " · ".join(parts)
 
 
 with st.sidebar:
@@ -92,17 +109,44 @@ with st.sidebar:
             models = fetch_models(base_url, api_key)
         except openai.APIError as error:
             st.error(chat.describe_error(error, host))
-    model = st.selectbox("Model", models) if models else None
+    model = (
+        st.selectbox(
+            "Model",
+            models,
+            help="auto lets the gateway pick a model for each message: a vision model for images, a "
+            "stronger model for coding and math, and a cheaper one otherwise. Each reply shows the model used.",
+        )
+        if models
+        else None
+    )
+    with st.expander("How model smart routing works", icon=":material/alt_route:"):
+        st.markdown(
+            "With **auto**, the gateway picks a model for each message before it reserves quota:\n"
+            "- **Images** go to the vision model, `qwen3.5-4b`.\n"
+            "- **Text** is labeled *simple*, *code*, or *math* by a small CPU decision model that reads your "
+            "message and the previous reply. Code and math go to `gpt-oss-120b` (3× price); simple messages "
+            "go to `gpt-oss-20b`.\n"
+            "- If the decision model is unavailable, keyword rules decide.\n\n"
+            "Each reply shows the model and why, such as *gpt-oss-120b (code)*. Choose a model by name to "
+            "skip routing; images then need `qwen3.5-4b`."
+        )
 
     st.header("Generation")
     system_prompt = st.text_area("System prompt", help="Optional. It counts against the context window.")
-    max_tokens = st.slider("Max output tokens", 1, chat.MAX_OUTPUT_TOKENS, 256)
+    max_tokens = st.slider(
+        "Max output tokens",
+        1,
+        chat.MAX_OUTPUT_TOKENS,
+        2048,
+        help="gpt-oss models reason before answering, and that reasoning counts toward this limit.",
+    )
     temperature = st.slider("Temperature", 0.0, 2.0, 0.7, 0.1)
 
     st.header("Quota")
     st.caption(
         f"Each request that the gateway accepts reserves {chat.CONTEXT_TOKENS:,} tokens of the "
-        "caller's daily allowance, even if it fails later. Daily limits reset at 00:00 UTC."
+        "caller's daily allowance, even if it fails later; stronger models charge more for them. "
+        "Daily limits reset at 00:00 UTC."
     )
     quota_box = st.empty()
 
@@ -112,9 +156,11 @@ if not chat.is_loopback(st.get_option("server.address")):
         "Run it from the client directory so .streamlit/config.toml binds it to 127.0.0.1."
     )
 
-st.title("AgentGateway POC")
-st.caption(f"{model} · {host}" if model else "Set the endpoint and API key in the sidebar.")
-clear_slot = st.empty()
+with st.container(key="chat_header", horizontal=True, vertical_alignment="center"):
+    with st.container(gap=None):
+        st.title("AgentGateway POC", anchor=False)
+        st.caption(f"{model} · {host}" if model else "Set the endpoint and API key in the sidebar.")
+    clear_slot = st.empty()
 
 
 def clear_history() -> None:
@@ -135,8 +181,8 @@ for message in st.session_state.messages:
         show_turn(message)
         if message.get("error"):
             st.error(message["error"])
-        if message.get("reservation"):
-            st.caption(reservation_text(*message["reservation"]))
+        if message.get("reservation") or message.get("route"):
+            st.caption(reply_caption(message.get("reservation"), message.get("route")))
         if message.get("excluded") and message["role"] == "assistant":
             st.caption(NOT_ANSWERED)
 
@@ -164,7 +210,7 @@ if prompt and (prompt.text.strip() or prompt.files):
                 f"Left out the {dropped} oldest messages so the request fits the "
                 f"{chat.CONTEXT_TOKENS:,}-token context and the {chat.MAX_IMAGES}-image limit."
             )
-        state = {"text": "", "reservation": None, "error": None}
+        state = {"text": "", "reservation": None, "route": None, "error": None}
         request = {"model": model, "messages": messages, "max_tokens": max_tokens, "temperature": temperature}
         with st.chat_message("assistant"):
             try:
@@ -173,13 +219,15 @@ if prompt and (prompt.text.strip() or prompt.files):
                 if isinstance(error, openai.APIStatusError):
                     # Requests that fail after admission still report their reservation.
                     state["reservation"] = state["reservation"] or chat.reservation(error.response.headers)
+                    state["route"] = state["route"] or chat.route(error.response.headers)
                 state["error"] = chat.describe_error(error, host)
                 st.error(state["error"])
             if state["reservation"]:
                 tokens, microusd = state["reservation"]
                 st.session_state.totals["tokens"] += tokens
                 st.session_state.totals["microusd"] += microusd
-                st.caption(reservation_text(tokens, microusd))
+            if state["reservation"] or state["route"]:
+                st.caption(reply_caption(state["reservation"], state["route"]))
             if not state["text"]:
                 turn["excluded"] = True
                 st.caption(NOT_ANSWERED)
@@ -189,6 +237,7 @@ if prompt and (prompt.text.strip() or prompt.files):
                 "role": "assistant",
                 "content": state["text"],
                 "reservation": state["reservation"],
+                "route": state["route"],
                 "error": state["error"],
                 "excluded": not state["text"],
             }
@@ -199,6 +248,6 @@ quota_box.markdown(
     f"**Reserved this session:** {totals['tokens']:,} tokens · ${totals['microusd'] / 1_000_000:,.4f}"
 )
 if st.session_state.messages:
-    # Drawn last, at the top of the page, so it also appears right after the first reply. The
+    # Drawn last, in the page header, so it also appears right after the first reply. The
     # callback clears the history before the rerun, so the button disappears with it.
     clear_slot.button("Clear chat history", key="clear_history", icon=":material/delete:", on_click=clear_history)

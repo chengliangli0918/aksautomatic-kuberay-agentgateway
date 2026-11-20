@@ -251,7 +251,7 @@ func TestPublicGatewayConfig(t *testing.T) {
 	for i := 3; i < len(noise.Pix); i += 4 {
 		noise.Pix[i] = 255
 	}
-	imageChat := `{"model":"` + modelID + `","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"` +
+	imageChat := `{"model":"` + visionModel + `","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"` +
 		dataURL(t, "image/png", noise) + `"}},{"type":"text","text":"Describe it."}]}],"max_tokens":32,"stream":true}`
 	for _, tc := range []struct {
 		key, body string

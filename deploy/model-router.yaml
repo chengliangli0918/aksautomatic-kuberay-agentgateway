@@ -1,0 +1,68 @@
+# CPU-only prompt classifier for quota-proxy's "auto" model (router/app.py). It needs no
+# GPU, internet access, or writable disk: the embedding model is baked into the image.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-router
+  namespace: inference
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: model-router
+  template:
+    metadata:
+      labels:
+        app: model-router
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: model-router
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: model-router
+          image: model-router:local
+          ports:
+            - {name: http, containerPort: 8080}
+          resources:
+            requests: {cpu: 250m, memory: 512Mi}
+            limits: {cpu: "1", memory: 1Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            seccompProfile:
+              type: RuntimeDefault
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 30
+          volumeMounts:
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-router
+  namespace: inference
+spec:
+  selector:
+    app: model-router
+  ports:
+    - {name: http, port: 8080, targetPort: http}

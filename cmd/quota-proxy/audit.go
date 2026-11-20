@@ -15,7 +15,10 @@ type callAudit struct {
 	StartedAt          time.Time `json:"started_at"`
 	Endpoint           string    `json:"endpoint"`
 	CallerID           string    `json:"caller_id,omitempty"`
+	RequestedModel     string    `json:"requested_model,omitempty"`
 	Model              string    `json:"model,omitempty"`
+	RouteReason        string    `json:"route_reason,omitempty"`
+	RouteSource        string    `json:"route_source,omitempty"`
 	Stream             bool      `json:"stream"`
 	MessageCount       int       `json:"message_count"`
 	ImageCount         int       `json:"image_count"`
@@ -24,6 +27,7 @@ type callAudit struct {
 	Temperature        *float64  `json:"temperature,omitempty"`
 	ReservedTokens     int64     `json:"reserved_tokens"`
 	TokenPriceMicrousd int64     `json:"token_price_microusd"`
+	PriceMultiplier    int64     `json:"price_multiplier,omitempty"`
 	ChargeMicrousd     int64     `json:"charge_microusd"`
 	CostBasis          string    `json:"cost_basis"`
 	Outcome            string    `json:"outcome"`
@@ -44,8 +48,10 @@ func newCallAudit(r *http.Request, now time.Time) *callAudit {
 	}
 }
 
-func (a *callAudit) setRequest(body chatRequest) {
-	a.Model, a.Stream = body.Model, body.Stream
+// setRequest records the validated request and the model selected for it.
+func (a *callAudit) setRequest(body chatRequest, m modelSpec, route, source string) {
+	a.RequestedModel, a.Model, a.RouteReason, a.RouteSource = body.Model, m.ID, route, source
+	a.PriceMultiplier, a.Stream = m.PriceMultiplier, body.Stream
 	a.MessageCount, a.MaxTokens, a.Temperature = len(body.Messages), body.MaxTokens, body.Temperature
 	for _, m := range body.Messages {
 		a.TextBytes += len(m.Content.text)

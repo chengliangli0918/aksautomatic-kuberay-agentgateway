@@ -39,6 +39,10 @@ spec:
       containers:
         - name: quota-proxy
           image: quota-proxy:local
+          env:
+            # Classifies "auto" prompts; without it, or when it fails, keyword rules decide.
+            - name: ROUTER_URL
+              value: http://model-router.inference.svc.cluster.local:8080/classify
           ports:
             - {name: http, containerPort: 8080}
           resources:

@@ -29,10 +29,6 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// Reserve the complete engine context, not a tokenizer-dependent estimate.
-const contextTokens int64 = 8192
-const modelID = "qwen3.5-4b"
-
 const (
 	maxBodyBytes = 12 << 20
 	maxTextBytes = 64 << 10
@@ -115,7 +111,13 @@ func openLedger(path string) (*sql.DB, error) {
 
 var errQuota = errors.New("caller quota exceeded")
 
-func reserve(ctx context.Context, db *sql.DB, c caller, now time.Time) error {
+// reservationCharge is the chargeback for one call: the model's complete context at the
+// caller's token price, scaled by the model's price multiplier.
+func reservationCharge(c caller, m modelSpec) int64 {
+	return m.ContextTokens * c.TokenPriceMicrousd * m.PriceMultiplier
+}
+
+func reserve(ctx context.Context, db *sql.DB, c caller, m modelSpec, now time.Time) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -134,14 +136,14 @@ func reserve(ctx context.Context, db *sql.DB, c caller, now time.Time) error {
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	cost := contextTokens * c.TokenPriceMicrousd
-	if requests >= c.RequestsPerMinute || tokens > c.DailyTokens-contextTokens ||
+	cost := reservationCharge(c, m)
+	if requests >= c.RequestsPerMinute || tokens > c.DailyTokens-m.ContextTokens ||
 		charge > c.DailyBudgetMicrousd-cost {
 		return errQuota
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO daily VALUES (?, ?, ?, ?)
 		ON CONFLICT(caller, day) DO UPDATE SET tokens=tokens+excluded.tokens, charge=charge+excluded.charge`,
-		c.ID, day, contextTokens, cost)
+		c.ID, day, m.ContextTokens, cost)
 	if err != nil {
 		return err
 	}
@@ -202,6 +204,13 @@ type chatRequest struct {
 	MaxTokens   int       `json:"max_tokens"`
 	Stream      bool      `json:"stream,omitempty"`
 	Temperature *float64  `json:"temperature,omitempty"`
+}
+
+// upstreamRequest is what Ray receives: the validated request for the selected model, plus
+// settings that callers cannot send themselves.
+type upstreamRequest struct {
+	chatRequest
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 // checkMessages rejects what the model's chat template or the engine's image limits would
@@ -300,6 +309,8 @@ type service struct {
 	now      func() time.Time
 	decoding chan struct{}
 	audit    *slog.Logger
+	// Classifies "auto" prompts; nil means only the keyword rules decide.
+	router *promptRouter
 }
 
 func newService(db *sql.DB, callers map[string]caller, upstream *url.URL) *service {
@@ -380,24 +391,20 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
-		a.Outcome = "forwarding"
-		s.proxy.ServeHTTP(w, r)
+		listModels(w)
 		a.Outcome = "completed"
-		if aw.status >= 400 {
-			a.Outcome = "upstream_error"
-		}
 		return
 	}
 	if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" {
 		reject(w, http.StatusNotFound, "only chat completions and model listing are supported")
 		return
 	}
-	payload, status, reason := s.readChat(w, r)
+	payload, m, status, reason := s.readChat(w, r)
 	if status != 0 {
 		reject(w, status, reason)
 		return
 	}
-	if err := reserve(r.Context(), s.db, c, s.now()); err != nil {
+	if err := reserve(r.Context(), s.db, c, m, s.now()); err != nil {
 		if errors.Is(err, errQuota) {
 			a.Outcome = "quota_exceeded"
 			reject(w, http.StatusTooManyRequests, "request, daily token, or daily chargeback budget exceeded")
@@ -408,14 +415,15 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	a.ReservedTokens = contextTokens
-	a.ChargeMicrousd = contextTokens * c.TokenPriceMicrousd
+	charge := reservationCharge(c, m)
+	a.ReservedTokens = m.ContextTokens
+	a.ChargeMicrousd = charge
 	a.Outcome = "admitted"
 	s.audit.InfoContext(r.Context(), "inference_admitted", "call", a)
 	r.Body = newPayloadBody(payload)
 	r.ContentLength = int64(len(payload))
-	w.Header().Set("X-Quota-Reserved-Tokens", fmt.Sprint(contextTokens))
-	w.Header().Set("X-Quota-Reserved-Microusd", fmt.Sprint(contextTokens*c.TokenPriceMicrousd))
+	w.Header().Set("X-Quota-Reserved-Tokens", fmt.Sprint(m.ContextTokens))
+	w.Header().Set("X-Quota-Reserved-Microusd", fmt.Sprint(charge))
 	a.Outcome = "forwarding"
 	s.proxy.ServeHTTP(w, r)
 	a.Outcome = "completed"
@@ -424,42 +432,73 @@ func (s *service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// readChat decodes and validates a chat request and returns the payload to forward, or an
-// HTTP status and reason for rejecting it.
-func (s *service) readChat(w http.ResponseWriter, r *http.Request) ([]byte, int, string) {
+// listModels answers /v1/models from the catalog, so callers also discover "auto".
+func listModels(w http.ResponseWriter) {
+	data := make([]map[string]any, len(modelList))
+	for i, id := range modelList {
+		data[i] = map[string]any{"id": id, "object": "model", "created": 0, "owned_by": "quota-proxy"}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data}); err != nil {
+		log.Printf("writing model list: %v", err)
+	}
+}
+
+// readChat decodes and validates a chat request, selects its model, and returns the payload to
+// forward and the model, or an HTTP status and reason for rejecting it.
+func (s *service) readChat(w http.ResponseWriter, r *http.Request) ([]byte, modelSpec, int, string) {
 	select {
 	case s.decoding <- struct{}{}:
 		defer func() { <-s.decoding }()
 	case <-r.Context().Done():
-		return nil, http.StatusServiceUnavailable, "request canceled while waiting to be read"
+		return nil, modelSpec{}, http.StatusServiceUnavailable, "request canceled while waiting to be read"
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	var body chatRequest
 	if err := dec.Decode(&body); err != nil {
-		return nil, http.StatusBadRequest, "invalid or oversized chat request"
+		return nil, modelSpec{}, http.StatusBadRequest, "invalid or oversized chat request"
 	}
 	if err := dec.Decode(new(any)); err != io.EOF {
-		return nil, http.StatusBadRequest, "expected exactly one JSON object"
+		return nil, modelSpec{}, http.StatusBadRequest, "expected exactly one JSON object"
 	}
-	if body.Model != modelID || len(body.Messages) == 0 || len(body.Messages) > 128 ||
-		body.MaxTokens < 1 || body.MaxTokens > 512 ||
+	m, known := models[body.Model]
+	if !known && body.Model != autoModel {
+		return nil, modelSpec{}, http.StatusBadRequest, "unsupported model; use " + strings.Join(modelList, ", ")
+	}
+	if len(body.Messages) == 0 || len(body.Messages) > 128 ||
+		body.MaxTokens < 1 || body.MaxTokens > maxOutputTokens ||
 		(body.Temperature != nil && (*body.Temperature < 0 || *body.Temperature > 2)) {
-		return nil, http.StatusBadRequest, "unsupported model, messages, temperature, or max_tokens (1..512 required)"
+		return nil, modelSpec{}, http.StatusBadRequest,
+			fmt.Sprintf("unsupported messages, temperature, or max_tokens (1..%d required)", maxOutputTokens)
 	}
 	if err := checkMessages(body.Messages); err != nil {
-		return nil, http.StatusBadRequest, err.Error()
+		return nil, modelSpec{}, http.StatusBadRequest, err.Error()
+	}
+	route, source := "requested", ""
+	if !known {
+		m, route, source = s.route(r.Context(), body.Messages)
+	}
+	if !m.Vision && hasImages(body.Messages) {
+		return nil, modelSpec{}, http.StatusBadRequest,
+			fmt.Sprintf("model %s does not accept images; use %s or %s", m.ID, autoModel, visionModel)
 	}
 	if a, ok := r.Context().Value(auditContextKey{}).(*callAudit); ok {
-		a.setRequest(body)
+		a.setRequest(body, m, route, source)
 	}
-	payload, err := json.Marshal(body)
+	w.Header().Set("X-Routed-Model", m.ID)
+	w.Header().Set("X-Route-Reason", route)
+	if source != "" {
+		w.Header().Set("X-Route-Source", source)
+	}
+	body.Model = m.ID
+	payload, err := json.Marshal(upstreamRequest{chatRequest: body, ReasoningEffort: m.ReasoningEffort})
 	if err != nil {
 		log.Printf("encoding validated request: %v", err)
-		return nil, http.StatusInternalServerError, "request encoding failed"
+		return nil, modelSpec{}, http.StatusInternalServerError, "request encoding failed"
 	}
-	return payload, 0, ""
+	return payload, m, 0, ""
 }
 
 func run() error {
@@ -481,8 +520,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	s := newService(db, callers, upstream)
+	if routerURL := os.Getenv("ROUTER_URL"); routerURL != "" {
+		s.router = newPromptRouter(routerURL)
+	}
 	server := &http.Server{
-		Addr: ":8080", Handler: newService(db, callers, upstream),
+		Addr: ":8080", Handler: s,
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
 		WriteTimeout: 10 * time.Minute, IdleTimeout: 60 * time.Second,
 		MaxHeaderBytes: 16 << 10,

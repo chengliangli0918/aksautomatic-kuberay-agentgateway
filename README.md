@@ -3,15 +3,18 @@
 Deploys a **public** OpenAI-compatible HTTPS inference API with per-caller
 authentication, request limits, daily token quotas, and daily chargeback budgets.
 
-![POC architecture: callers reach agentgateway over public HTTPS; the quota proxy enforces per-caller limits before Ray Serve routes requests to eight vLLM replicas on one 8xA100 node](docs/architecture.svg)
+![POC architecture: callers reach agentgateway over public HTTPS; the quota proxy enforces per-caller limits and picks a model with a CPU model router before Ray Serve routes requests to three models on one 8xA100 node](docs/architecture.svg)
 
 A 2560×1440 PNG for slides is in [`docs/architecture.png`](docs/architecture.png).
 
 ```text
 Internet caller -- HTTPS (Let's Encrypt) --> Azure public IP + DNS name
        --> agentgateway (2 replicas: TLS, per-IP rate limit)   [inference-edge]
-       --> quota-proxy (API key + atomic durable reservation)   [inference]
-       --> KubeRay RayService / Ray Serve LLM / vLLM
+       --> quota-proxy (API key, "auto" model routing,
+                        atomic durable reservation)            [inference]
+           <-> model-router (CPU decision model for "auto")    [inference]
+       --> KubeRay RayService / Ray Serve LLM / vLLM:
+           gpt-oss-20b x3, gpt-oss-120b x3, qwen3.5-4b x2
        --> 1 x Standard_ND96amsr_A100_v4 (8 x A100)
 ```
 
@@ -23,13 +26,30 @@ Internet caller -- HTTPS (Let's Encrypt) --> Azure public IP + DNS name
 - Region: `italynorth`.
 - AKS cluster: `aks-vllm-auto`, SKU **Automatic** with node auto-provisioning.
 - GPU: exactly `Standard_ND96amsr_A100_v4`; no SKU or region substitution.
-- Model: public `Qwen/Qwen3.5-4B` (Apache 2.0), API model ID `qwen3.5-4b`,
-  eight vLLM replicas with one GPU each, context length 8192. The model fits
-  on one A100; the replicas use the requested VM deliberately, not as a
+- Models: three public Apache 2.0 models, one vLLM replica per GPU, each with
+  context length 8192. The split uses the requested VM deliberately, not as a
   cost-optimized model/hardware recommendation.
+
+  | API model ID | Hugging Face model | Replicas | Role | Chargeback |
+  | --- | --- | --- | --- | --- |
+  | `gpt-oss-20b` | `openai/gpt-oss-20b` | 3 | Cheap text model | 1× |
+  | `gpt-oss-120b` | `openai/gpt-oss-120b` | 3 | Strong text model for coding and math | 3× |
+  | `qwen3.5-4b` | `Qwen/Qwen3.5-4B` | 2 | The only vision model | 1× |
+  | `auto` | — | — | The quota proxy picks one of the above per request; see [Model routing](#model-routing) | As routed |
+
+- gpt-oss models are text-only reasoning models. Their MXFP4 weights load as
+  about 14 GiB and 66 GiB, so each fits one A100 80GB; vLLM runs them with
+  Marlin kernels on A100. One gpt-oss-120b replica keeps about 84,000 tokens of
+  KV cache, enough for about 10 concurrent full-context requests (30 across its
+  3 replicas); two GPUs per replica (`tensor_parallel_size: 2`) would allow
+  many more. They reason before answering, and reasoning tokens count toward
+  `max_tokens`; vLLM returns the reasoning in a separate `reasoning` field, not
+  in the answer. The
+  quota proxy sets `reasoning_effort` to `low` for gpt-oss-20b and `medium`
+  for gpt-oss-120b; callers cannot change it.
 - Qwen3.5 is a vision-language model that thinks before answering by default.
-  The engine runs with thinking off (`enable_thinking: false`), because
-  reasoning would use up the 512-token output limit. It accepts at most 2
+  The engine runs with thinking off (`enable_thinking: false`), so image
+  questions get direct answers. It accepts at most 2
   images per request and no video, resizes each image to at most 2,097,152
   pixels (up to 2,050 context tokens), and never fetches media URLs. Sampling
   defaults are the model card's non-thinking settings (temperature 0.7, top_p
@@ -73,10 +93,13 @@ The example policy sets:
 | Chargeback price per token | 10 micro-USD = USD 10 / million tokens |
 
 Every **admitted inference call reserves 8192 tokens** (the complete engine
-context, input plus output) and `8192 * token_price_microusd` **before** calling
-vLLM. This is intentionally conservative: it is not actual token usage or an
-Azure token price. At the example limits, only **12 calls/day** fit. The same
-maximum token rate is charged for input and output.
+context, input plus output) and charges
+`8192 * token_price_microusd * price multiplier` **before** calling vLLM. The
+multiplier is 3 for gpt-oss-120b and 1 for the other models; it is set in
+[`cmd/quota-proxy/models.go`](cmd/quota-proxy/models.go). This is
+intentionally conservative: it is not actual token usage or an Azure token
+price. At the example limits, only **12 calls/day** fit, or 4 if they all go
+to gpt-oss-120b. The same maximum token rate is charged for input and output.
 
 - Reservations are never refunded, including upstream errors, invalid
   context-length responses, caller disconnects, and incomplete SSE streams.
@@ -93,13 +116,17 @@ maximum token rate is charged for input and output.
 - HTTP 401 means missing/invalid key; 429 means a caller limit is exhausted.
   400 means unsupported input; 502/503 means an upstream/ledger failure.
   Admission responses expose `X-Quota-Reserved-Tokens` and
-  `X-Quota-Reserved-Microusd` when a reservation succeeded.
+  `X-Quota-Reserved-Microusd` when a reservation succeeded, and every validated
+  chat response exposes `X-Routed-Model` and `X-Route-Reason`, plus
+  `X-Route-Source` for `auto`.
 - Only `GET /v1/models` and `POST /v1/chat/completions` are supported.
-  Model listing is authenticated but not charged. Chat accepts `model`,
+  The quota proxy answers model listing from its catalog, with `auto` first;
+  listing is authenticated but not charged. Chat accepts `model` (`auto`,
+  `gpt-oss-20b`, `gpt-oss-120b`, or `qwen3.5-4b`),
   `messages` (system/user/assistant text, with at least one user message and a
-  system message only first, as the model's chat template requires),
-  `max_tokens` (required, 1..512), `stream`, and optional `temperature`.
-  User messages can also carry images: at most 2 per request, as base64 PNG or
+  system message only first, as the models' chat templates require),
+  `max_tokens` (required, 1..4096), `stream`, and optional `temperature`.
+  User messages can also carry images, for `auto` or `qwen3.5-4b` only: at most 2 per request, as base64 PNG or
   JPEG `data:` URLs of at most 4 MiB and 16,777,216 pixels each, with an aspect
   ratio of at most 200:1. Remote image URLs are rejected, because vLLM would
   fetch them from inside the cluster. Message text is limited to 64 KiB and
@@ -109,13 +136,15 @@ maximum token rate is charged for input and output.
   bypass.
 - Do not enable upstream/gateway automatic retries, change the model context
   above 8192, or enable multiple returned sequences without updating admission.
-  A model change requires coordinated proxy validation, engine config, and tests.
+  A model change requires coordinated changes to the proxy's model catalog,
+  the engine config, and tests.
 - Deleting/rolling back the ledger disk or changing caller IDs resets accounting.
   Protect the PVC and RBAC; back up accounting data as required. Ledger records
   currently have no automatic retention policy.
 
 NetworkPolicies allow only agentgateway pods in `inference-edge` to reach the
-quota service and only the quota service to reach Ray Serve. Ray's
+quota service, and only the quota service to reach Ray Serve and the model
+router; the router has no egress at all. Ray's
 dashboard/GCS/client ports are not exposed outside the cluster. KubeRay retains
 dashboard access for reconciliation.
 Privileged cluster administrators can bypass these controls; callers must not
@@ -133,11 +162,14 @@ the client and forwarded to Ray for correlation; client-supplied IDs are ignored
 - `inference_request` is emitted when handling ends, including rejected requests,
   upstream errors, canceled requests, and interrupted streams.
 - The nested `call` object includes `request_id`, UTC `started_at`, `caller_id`
-  (only after authentication), endpoint, validated model, streaming flag, message
+  (only after authentication), endpoint, `requested_model` (for example `auto`),
+  the selected `model`, `route_reason` (`image`, `code`, `math`, `simple`, or
+  `requested`), `route_source` (`model` or `rules`, for `auto`), streaming flag, message
   and image counts, text byte count, output limit, optional temperature, HTTP
   status, response byte count, elapsed milliseconds, and outcome.
-- `reserved_tokens`, `token_price_microusd`, and `charge_microusd` record the
-  **actual application chargeback**: `8192 * token_price_microusd` for admitted
+- `reserved_tokens`, `token_price_microusd`, `price_multiplier`, and
+  `charge_microusd` record the **actual application chargeback**:
+  `8192 * token_price_microusd * price_multiplier` for admitted
   inference, zero for rejected requests and model listing. `cost_basis` is
   `reserved_context_chargeback`. This is **not measured token usage or per-call
   Azure infrastructure cost**. Failed calls retain their charge. Do not sum both
@@ -158,6 +190,84 @@ appropriate retention policy. Abrupt process/node loss can omit completion
 events, and log delivery is not atomic with the SQLite reservation; the ledger
 remains the durable source of aggregate charges. No log collector or Azure
 resource is provisioned by this change.
+
+## Model routing
+
+Callers that send `"model": "auto"` let the quota proxy choose the model for
+each request, before it reserves quota, because the charge depends on the
+model. Explicit model IDs skip routing.
+
+1. Any image in the request → `qwen3.5-4b` (`image`), the only vision model.
+   gpt-oss models cannot read images, so image questions don't get the
+   strongest model.
+2. Otherwise a small **decision model**, the `model-router` service in
+   [`router/`](router/), labels the text `simple`, `code`, or `math`:
+   `code` and `math` go to `gpt-oss-120b`, `simple` to `gpt-oss-20b`.
+
+The router embeds the newest user message with
+[`BAAI/bge-small-en-v1.5`](https://huggingface.co/BAAI/bge-small-en-v1.5)
+(33M parameters, MIT, quantized ONNX on CPU) and picks the label whose example
+prompts in [`router/examples.json`](router/examples.json) have the most similar
+average embedding. The reply before the message counts for a quarter of the
+score, so follow-ups such as "make it work for floats too" stay with their
+conversation. It runs as 2 CPU-only replicas (250m CPU and 512 MiB requested,
+about 265 MiB used), answers in about 12 ms, and uses no GPU.
+
+On the 45 held-out prompts in [`router/eval.json`](router/eval.json), which
+share none of the examples and include tricky ones such as "zip code" and
+"function of red blood cells", the router chose the right model for 44. The
+keyword rules below chose right for 32 and sent 13 coding and math questions,
+such as "How much is 7% sales tax on $250?", to the cheap model. This small,
+hand-written set is a sanity check, not a benchmark. It is an English model:
+a few French and Spanish test prompts were classified correctly, but other
+languages are untested. To change its behavior, edit the examples, run its
+tests, and rebuild its image.
+
+If the router is not configured (`ROUTER_URL` unset), fails, or takes longer
+than 500 ms, the quota proxy falls back to keyword and syntax rules in
+[`cmd/quota-proxy/models.go`](cmd/quota-proxy/models.go): code fences,
+programming syntax, stack traces, language names, equations, math symbols, and
+words such as "solve" or "integral".
+
+Responses report the choice in `X-Routed-Model`, `X-Route-Reason`, and
+`X-Route-Source` (`model` or `rules`); the audit log records the same.
+The router receives prompt text, at most 2,000 characters each of the message
+and the previous reply, but never logs it. A NetworkPolicy lets only the quota
+proxy reach it and blocks all its egress; its model is baked into its image.
+
+**agentgateway has no built-in prompt classifier.** agentgateway v1.7.0 has no
+semantic or complexity-based routing, no reserved `auto` model, and no
+image-aware routing. It does provide building blocks for a routing decision:
+
+- [Virtual models](https://agentgateway.dev/docs/standalone/latest/llm/virtual-models/)
+  in its `llm` mode route one client-facing model name with `conditional`
+  rules (CEL `when` expressions over the request) or a `callout` to an external
+  HTTP service that picks the model (new in 1.7.0). See the
+  [cost-routing](https://github.com/agentgateway/agentgateway/tree/v1.7.0/examples/llm-cost-routing)
+  and [callout](https://github.com/agentgateway/agentgateway/tree/v1.7.0/examples/llm-callout-jev)
+  examples.
+- An [external processor (ExtProc)](https://agentgateway.dev/docs/standalone/latest/configuration/traffic-management/extproc/)
+  can rewrite the request's `model` field. The documented
+  [vLLM Semantic Router integration](https://agentgateway.dev/docs/standalone/latest/integrations/llm/routing/vllm-semantic-router/)
+  uses it to classify prompts with a model
+  ([example](https://github.com/agentgateway/agentgateway/tree/v1.7.0/examples/llm-semantic-routing)).
+- CEL transformations can copy body fields into headers before route matching.
+
+This deployment uses none of them. agentgateway forwards every `/v1/*` request
+to the quota proxy, which must know the selected model before charging, and
+the `llm` mode answers `/v1/models` itself and manages provider credentials.
+To move routing to the gateway later, for example with vLLM Semantic Router,
+have it rewrite `model` to an explicit model ID; the quota proxy then charges
+for that model.
+
+Run the router tests from `router/`; the first run downloads the 67 MB model:
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m unittest -v
+```
+
+They check the held-out accuracy, follow-ups, and the HTTP API.
 
 ## Public endpoint
 
@@ -286,7 +396,7 @@ bash scripts/deploy.sh --confirm-cost
 
 The script runs these steps:
 1. Checks policies, SKU restrictions, family/regional quota, and pricing.
-2. Creates or reuses the Automatic cluster and Basic ACR, builds the proxy in ACR, and attaches pull permissions.
+2. Creates or reuses the Automatic cluster and Basic ACR, builds the proxy and the model router in ACR, and attaches pull permissions.
 3. Adds the Deployment Safeguards exclusions above and waits until they take effect.
 4. Installs pinned operators and applies the network policies, the dedicated GPU NodePool, the RayService, and the durable ledger.
 5. Installs cert-manager and the public agentgateway edge.
@@ -305,11 +415,13 @@ kubectl get nodes -l workload=inference-a100
 kubectl -n inference logs -l ray.io/node-type=worker -c ray-worker --tail=100
 ```
 
-Model downloads and initial CUDA compilation can take many minutes. Public
-model/image downloads require outbound access. Model cache is ephemeral and
-downloads again after worker replacement. If allocation or model loading fails,
-inspect events and operator/worker logs; do not assume waiting is cost-free.
-No Hugging Face token is required for the default public model.
+Model downloads and initial CUDA compilation can take many minutes; the three
+models download about 83 GB. Public
+model/image downloads require outbound access; gpt-oss also fetches its
+tiktoken vocabulary from `openaipublic.blob.core.windows.net`. Model cache is
+ephemeral and downloads again after worker replacement. If allocation or model
+loading fails, inspect events and operator/worker logs; do not assume waiting
+is cost-free. No Hugging Face token is required for the default public models.
 
 The Ray worker pod stays `0/1` Ready by design. KubeRay's injected worker
 readiness probe also checks for a Serve HTTP proxy, but this RayService runs
@@ -320,7 +432,8 @@ its operator reaches the head's port 8000; the `isolate-ray` NetworkPolicy
 allows that.
 
 The NodePool constrains aggregate capacity to 96 vCPUs / 8 GPUs, the Ray worker
-count to one, and Serve to eight one-GPU replicas. Karpenter limits are eventually consistent,
+count to one, and Serve to eight one-GPU replicas (3 gpt-oss-20b, 3
+gpt-oss-120b, and 2 qwen3.5-4b). Karpenter limits are eventually consistent,
 not financial guarantees. Drift/underutilized disruption is blocked; empty nodes
 can consolidate after five minutes. Plan explicit maintenance.
 
@@ -344,11 +457,18 @@ Do not delete the quota PVC during updates. For partial deployment failures,
 inspect resources before retrying; completed Azure operations are not rolled back.
 
 Two kinds of update don't need that procedure:
-- **Engine settings only** (`serveConfigV2` in
+- **Engine or model settings only** (`serveConfigV2` in
   [`deploy/rayservice.yaml`](deploy/rayservice.yaml)): KubeRay applies them to
   the running cluster, and Ray Serve replaces the replicas one at a time, so the
-  endpoint stays up. Run `kubectl apply -f deploy/rayservice.yaml`.
-- **Quota proxy code only:** build a new image and roll it out:
+  endpoint stays up. Run `kubectl apply -f deploy/rayservice.yaml`. This also
+  adds, removes, or resizes models, as long as the replicas still fit 8 GPUs.
+  Ray Serve gives every model in the application one config version, so such a
+  change restarts all models, 20% of each model's replicas at a time: a model
+  with several replicas stays available, but a one-replica model is down while
+  it reloads. Adding the gpt-oss models took about 20 minutes, including the
+  83 GB download. Update the quota proxy's model catalog to match after the
+  new models are `HEALTHY` in `serve status` on the head pod.
+- **Quota proxy or model router code only:** build a new image and roll it out:
 
 ```bash
 tag=$(date -u +%Y%m%d%H%M%S)
@@ -356,6 +476,11 @@ az acr build --registry "$ACR_NAME" --image "quota-proxy:$tag" --platform linux/
 sed "s|image: quota-proxy:local|image: $ACR_NAME.azurecr.io/quota-proxy:$tag|" \
   deploy/quota-proxy.yaml | kubectl apply -f -
 kubectl -n inference rollout status deployment/quota-proxy
+# For the router, including changes to router/examples.json:
+az acr build --registry "$ACR_NAME" --image "model-router:$tag" --platform linux/amd64 router
+sed "s|image: model-router:local|image: $ACR_NAME.azurecr.io/model-router:$tag|" \
+  deploy/model-router.yaml | kubectl apply -f -
+kubectl -n inference rollout status deployment/model-router
 ```
 
 ## Access and verify
@@ -376,7 +501,7 @@ curl -i "$INFERENCE_URL/v1/models"  # must return 401 without a key
 API_KEY=$(tr -d '\n' < .secrets/team-a.key)
 curl --fail-with-body --no-buffer "$INFERENCE_URL/v1/chat/completions" \
   -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
-  -d '{"model":"qwen3.5-4b","messages":[{"role":"user","content":"Say hello."}],"max_tokens":32,"stream":true}'
+  -d '{"model":"auto","messages":[{"role":"user","content":"Say hello."}],"max_tokens":256,"stream":true}'
 unset API_KEY
 ```
 
@@ -396,8 +521,9 @@ curl -i --connect-to "$host:443:127.0.0.1:18443" "$INFERENCE_URL/v1/models"
 OpenAI-compatible SDKs need these settings:
 - `base_url`: `$INFERENCE_URL/v1`
 - `api_key`: the caller's key
-- Model: `qwen3.5-4b`
-- `max_tokens`: set explicitly, between 1 and 512
+- Model: `auto`, or one of the model IDs above
+- `max_tokens`: set explicitly, between 1 and 4096. gpt-oss models spend part
+  of it on reasoning; with too low a limit the answer is cut off or empty.
 
 For a live quota smoke test, create a separate test caller with
 `daily_tokens: 8192`, send the same authenticated chat twice: the first must
@@ -467,8 +593,12 @@ directly, so disconnect a VPN that tunnels the gateway's address range.
   the app from `client/` so the file applies. Anyone who can open the app can
   spend your quota, so it shows a warning when it may be reachable from other
   machines.
+- **Models:** the model list starts with `auto`, so each message goes to the
+  model the quota proxy picks; choose a model ID to use it directly. Each reply
+  shows the model that answered, with the routing reason for `auto`.
 - **Quota:** each reply shows its reservation (8,192 tokens and the chargeback
-  amount), and the sidebar totals them for the session. The API doesn't report
+  amount, which depends on the model), and the sidebar totals them for the
+  session. The API doesn't report
   the remaining allowance. Listing models is free. **Clear chat history**,
   above the conversation, starts over but keeps the session total.
 - **No automatic retries:** SDK retries are off, because each retry would
@@ -477,12 +607,14 @@ directly, so disconnect a VPN that tunnels the gateway's address range.
   the + button; up to 2 per message, in PNG, JPEG, WebP, GIF, or BMP. The app
   turns each upright, scales it down to the engine's 2,097,152-pixel limit, and
   sends it inline as PNG (JPEG for photos).
-- **Context:** the app counts every UTF-8 byte of the NFC-normalized text as
-  one token, a strict upper bound for Qwen3.5's tokenizer, which normalizes to
-  NFC before byte-level BPE, and 2,050 tokens per image. It leaves out the
+- **Context:** both tokenizers are byte-level BPE, so no token is shorter
+  than one UTF-8 byte. Qwen3.5 normalizes text to NFC first and gpt-oss does
+  not, so the app counts the larger of the raw and NFC byte counts, plus
+  2,050 tokens per image and room for the chat templates. It leaves out the
   oldest turns so a request never exceeds the 8,192-token context or carries
   more than 2 images, and it refuses a message that can't fit before sending
-  it. Prompts that got no reply stay in the conversation with their error
+  it. Max output tokens defaults to 2,048 so gpt-oss has room to reason.
+  Prompts that got no reply stay in the conversation with their error
   message, but are left out of later requests.
 - **HTTPS only:** the app refuses plain-HTTP endpoints except on loopback, so
   a key is never sent unencrypted.

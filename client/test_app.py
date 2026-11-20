@@ -13,7 +13,7 @@ from streamlit.testing.v1 import AppTest
 
 import chat
 
-MODEL = "qwen3.5-4b"
+MODELS = ["auto", "gpt-oss-20b", "gpt-oss-120b", "qwen3.5-4b"]
 KEY = "test-key"
 # The only fields cmd/quota-proxy accepts; a request with any other field is rejected.
 ALLOWED_FIELDS = {"model", "messages", "max_tokens", "stream", "temperature"}
@@ -62,6 +62,12 @@ class RequestMessagesTest(unittest.TestCase):
         # 9,000 tokens), which cannot fit the context.
         with self.assertRaises(ValueError):
             chat.request_messages("", [{"role": "user", "content": "\U0001d160" * 1000}], 256)
+
+    def test_counts_raw_bytes_for_tokenizers_without_normalization(self):
+        # NFC composes each "e" + U+0301 into one 2-byte character, but gpt-oss's tokenizer
+        # sees all 9,000 raw bytes, which cannot fit the context.
+        with self.assertRaises(ValueError):
+            chat.request_messages("", [{"role": "user", "content": "e\u0301" * 3000}], 256)
 
     def test_sends_images_within_the_image_limit(self):
         image = chat.image_data_url(encoded_image((64, 48)))
@@ -163,8 +169,8 @@ class _GatewayHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self._authorized():
-            model = {"id": MODEL, "object": "model", "created": 0, "owned_by": "test"}
-            self._send_json(200, {"object": "list", "data": [model]})
+            models = [{"id": model, "object": "model", "created": 0, "owned_by": "test"} for model in MODELS]
+            self._send_json(200, {"object": "list", "data": models})
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -174,8 +180,8 @@ class _GatewayHandler(BaseHTTPRequestHandler):
         valid = (
             set(body) <= ALLOWED_FIELDS
             and body.get("stream") is True
-            and body.get("model") == MODEL
-            and 1 <= body.get("max_tokens", 0) <= 512
+            and body.get("model") in MODELS
+            and 1 <= body.get("max_tokens", 0) <= chat.MAX_OUTPUT_TOKENS
             and _valid_messages(body.get("messages", []))
         )
         if not valid:
@@ -186,17 +192,23 @@ class _GatewayHandler(BaseHTTPRequestHandler):
             self._send_json(429, {"error": {"message": message, "type": "Too Many Requests"}})
             return
         self.server.quota -= 1
+        has_images = any(isinstance(m["content"], list) for m in body["messages"])
+        model, reason = ("qwen3.5-4b", "image") if has_images else ("gpt-oss-20b", "simple")
+        if body["model"] != "auto":
+            model, reason = body["model"], "requested"
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("X-Quota-Reserved-Tokens", "8192")
         self.send_header("X-Quota-Reserved-Microusd", "81920")
+        self.send_header("X-Routed-Model", model)
+        self.send_header("X-Route-Reason", reason)
         self.end_headers()
         for text in ("Hello", " from", " Qwen"):
             chunk = {
                 "id": "chunk",
                 "object": "chat.completion.chunk",
                 "created": 0,
-                "model": MODEL,
+                "model": model,
                 "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
             }
             self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
@@ -224,13 +236,15 @@ class AppTestCase(unittest.TestCase):
     def test_streams_replies_and_leaves_failed_prompts_out_of_context(self):
         self.app.run()
         self.assertFalse(self.app.exception)
-        self.assertEqual(self.app.sidebar.selectbox[0].value, MODEL)
+        self.assertEqual(self.app.sidebar.selectbox[0].value, "auto")
 
         self.gateway.quota = 1
         self.send("first question")
         reply = [m for m in self.app.chat_message if m.name == "assistant"][-1]
         self.assertEqual(reply.markdown[0].value, "Hello from Qwen")
         self.assertIn("Reserved 8,192 tokens", reply.caption[0].value)
+        self.assertIn("Model: gpt-oss-20b (simple)", reply.caption[0].value)
+        self.assertEqual(self.gateway.chat_requests[-1]["model"], "auto")
 
         self.send("second question")
         self.assertIn("Caller limit reached (HTTP 429)", self.app.error[0].value)
@@ -257,6 +271,7 @@ class AppTestCase(unittest.TestCase):
         self.assertEqual(content[1]["text"], "What is in this picture?")
         reply = [m for m in self.app.chat_message if m.name == "assistant"][-1]
         self.assertEqual(reply.markdown[0].value, "Hello from Qwen")
+        self.assertIn("Model: qwen3.5-4b (image)", reply.caption[0].value)
 
     def test_clears_chat_history(self):
         def clear_buttons():

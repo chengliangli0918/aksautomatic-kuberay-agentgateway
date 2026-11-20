@@ -64,7 +64,7 @@ func TestAtomicQuota(t *testing.T) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					err := reserve(context.Background(), db, c, now)
+					err := reserve(context.Background(), db, c, models[visionModel], now)
 					if err == nil {
 						accepted.Add(1)
 					} else if !errors.Is(err, errQuota) {
@@ -97,7 +97,7 @@ func TestWindowsIdentityAndPersistence(t *testing.T) {
 	c.RequestsPerMinute = 1
 	c.DailyTokens = 2 * contextTokens
 	now := time.Date(2026, 11, 20, 23, 57, 0, 0, time.UTC)
-	if err := reserve(context.Background(), db, c, now); err != nil {
+	if err := reserve(context.Background(), db, c, models[visionModel], now); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -110,20 +110,20 @@ func TestWindowsIdentityAndPersistence(t *testing.T) {
 	defer db.Close()
 	rotated := testCaller("stable-id", "new-key")
 	rotated.RequestsPerMinute, rotated.DailyTokens = c.RequestsPerMinute, c.DailyTokens
-	if err := reserve(context.Background(), db, rotated, now); !errors.Is(err, errQuota) {
+	if err := reserve(context.Background(), db, rotated, models[visionModel], now); !errors.Is(err, errQuota) {
 		t.Fatalf("restart/key rotation reset minute quota: %v", err)
 	}
-	if err := reserve(context.Background(), db, rotated, now.Add(time.Minute)); err != nil {
+	if err := reserve(context.Background(), db, rotated, models[visionModel], now.Add(time.Minute)); err != nil {
 		t.Fatalf("minute did not reset: %v", err)
 	}
-	if err := reserve(context.Background(), db, rotated, now.Add(2*time.Minute)); !errors.Is(err, errQuota) {
+	if err := reserve(context.Background(), db, rotated, models[visionModel], now.Add(2*time.Minute)); !errors.Is(err, errQuota) {
 		t.Fatalf("daily quota was not retained: %v", err)
 	}
-	if err := reserve(context.Background(), db, rotated, now.Add(3*time.Minute)); err != nil {
+	if err := reserve(context.Background(), db, rotated, models[visionModel], now.Add(3*time.Minute)); err != nil {
 		t.Fatalf("UTC day did not reset: %v", err)
 	}
 	other := testCaller("other", "other-key")
-	if err := reserve(context.Background(), db, other, now); err != nil {
+	if err := reserve(context.Background(), db, other, models[visionModel], now); err != nil {
 		t.Fatalf("callers are not isolated: %v", err)
 	}
 }
@@ -157,8 +157,8 @@ func TestHTTPAdmissionAndStreaming(t *testing.T) {
 		{"invalid auth", "wrong", validChat, 401},
 		{"multiple outputs", "secret", strings.TrimSuffix(validChat, "}") + `,"n":2}`, 400},
 		{"missing cap", "secret", strings.Replace(validChat, `"max_tokens":32,`, "", 1), 400},
-		{"excess output", "secret", strings.Replace(validChat, `"max_tokens":32`, `"max_tokens":513`, 1), 400},
-		{"other model", "secret", strings.Replace(validChat, modelID, "other-model", 1), 400},
+		{"excess output", "secret", strings.Replace(validChat, `"max_tokens":32`, `"max_tokens":4097`, 1), 400},
+		{"other model", "secret", strings.Replace(validChat, visionModel, "other-model", 1), 400},
 		{"system not first", "secret", strings.Replace(validChat, `"content":"Hello"}`,
 			`"content":"Hello"},{"role":"system","content":"Be brief."}`, 1), 400},
 		{"no user message", "secret", strings.Replace(validChat, `"role":"user"`, `"role":"system"`, 1), 400},
@@ -245,7 +245,7 @@ func TestImageMessages(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			forwarded.Store("")
-			body := `{"model":"` + modelID + `","messages":[` + tc.messages + `],"max_tokens":32}`
+			body := `{"model":"` + visionModel + `","messages":[` + tc.messages + `],"max_tokens":32}`
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 			req.Header.Set("Authorization", "Bearer secret")
 			w := httptest.NewRecorder()

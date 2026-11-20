@@ -116,7 +116,7 @@ func TestCallAudit(t *testing.T) {
 					first.Call.RequestID != a.RequestID || first.Call.Status != 0 ||
 					a.ReservedTokens != contextTokens || a.ChargeMicrousd != contextTokens*c.TokenPriceMicrousd ||
 					first.Call.ChargeMicrousd != a.ChargeMicrousd || a.TokenPriceMicrousd != c.TokenPriceMicrousd ||
-					a.Model != modelID || a.CallerID != c.ID || a.MessageCount != 1 || a.MaxTokens != 32 ||
+					a.Model != visionModel || a.CallerID != c.ID || a.MessageCount != 1 || a.MaxTokens != 32 ||
 					a.Stream != strings.Contains(tc.body, `"stream":true`) || a.TextBytes != len("Hello") {
 					t.Fatalf("incorrect admitted call: %+v / %+v", first, a)
 				}

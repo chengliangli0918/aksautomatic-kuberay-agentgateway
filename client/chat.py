@@ -14,17 +14,19 @@ import openai
 from PIL import Image, ImageOps
 
 # These must match the deployment: vLLM max_model_len in deploy/rayservice.yaml and the
-# limits enforced by cmd/quota-proxy/main.go.
+# limits enforced by cmd/quota-proxy/main.go and cmd/quota-proxy/models.go.
 CONTEXT_TOKENS = 8192
-MAX_OUTPUT_TOKENS = 512
+# gpt-oss reasons before answering, and its reasoning tokens count toward this limit.
+MAX_OUTPUT_TOKENS = 4096
 MAX_MESSAGES = 128
-# Qwen3.5's tokenizer NFC-normalizes text and then applies byte-level BPE, so text never
-# needs more tokens than its NFC form has UTF-8 bytes. Raw bytes are not a bound: NFC
-# lengthens some characters, such as U+1D160. The allowances exceed the chat template's
-# measured overhead of 5 tokens per message and 7 for the reply prefix. A request that
-# overflows the context still costs a full quota reservation, so the client never sends one.
+# Both tokenizers are byte-level BPE, so no token is shorter than one byte. Qwen3.5 first
+# NFC-normalizes the text, which lengthens some characters, such as U+1D160; gpt-oss's
+# o200k tokenizer encodes the raw text. The larger of the two UTF-8 byte counts bounds
+# both. The allowances exceed the chat templates' overhead, including the system message
+# that gpt-oss's template always adds. A request that overflows the context still costs a
+# full quota reservation, so the client never sends one.
 PER_MESSAGE_TOKENS = 8
-FIXED_TOKENS = 64
+FIXED_TOKENS = 128
 # The engine resizes each image to at most MAX_IMAGE_PIXELS and turns every 32x32 block into
 # one token, plus 2 tokens that mark the image. The proxy accepts at most MAX_IMAGES PNG or
 # JPEG images of at most MAX_IMAGE_BYTES per request.
@@ -113,13 +115,14 @@ def image_count(messages: list[dict]) -> int:
     return sum(p["type"] == "image_url" for m in messages for p in _parts(m))
 
 
+def text_tokens(text: str) -> int:
+    return max(len(text.encode("utf-8")), len(unicodedata.normalize("NFC", text).encode("utf-8")))
+
+
 def token_upper_bound(messages: list[dict]) -> int:
     return FIXED_TOKENS + sum(
         PER_MESSAGE_TOKENS
-        + sum(
-            IMAGE_TOKENS if p["type"] == "image_url" else len(unicodedata.normalize("NFC", p["text"]).encode("utf-8"))
-            for p in _parts(m)
-        )
+        + sum(IMAGE_TOKENS if p["type"] == "image_url" else text_tokens(p["text"]) for p in _parts(m))
         for m in messages
     )
 
@@ -161,6 +164,15 @@ def reservation(headers: Mapping[str, str]) -> tuple[int, int] | None:
         return int(headers["x-quota-reserved-tokens"]), int(headers["x-quota-reserved-microusd"])
     except (KeyError, ValueError):
         return None
+
+
+def route(headers: Mapping[str, str]) -> str | None:
+    """Return the model that quota-proxy selected, with the reason when it chose for "auto"."""
+    model = headers.get("x-routed-model")
+    reason = headers.get("x-route-reason")
+    if not model:
+        return None
+    return f"{model} ({reason})" if reason and reason != "requested" else model
 
 
 def describe_error(error: Exception, host: str) -> str:
