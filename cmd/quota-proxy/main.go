@@ -480,7 +480,7 @@ func (s *service) readChat(w http.ResponseWriter, r *http.Request) ([]byte, mode
 	if !known {
 		m, route, source = s.route(r.Context(), body.Messages)
 	}
-	if !m.Vision && hasImages(body.Messages) {
+	if known && !m.Vision && hasImages(body.Messages) {
 		return nil, modelSpec{}, http.StatusBadRequest,
 			fmt.Sprintf("model %s does not accept images; use %s or %s", m.ID, autoModel, visionModel)
 	}
@@ -491,6 +491,10 @@ func (s *service) readChat(w http.ResponseWriter, r *http.Request) ([]byte, mode
 	w.Header().Set("X-Route-Reason", route)
 	if source != "" {
 		w.Header().Set("X-Route-Source", source)
+	}
+	if !m.Vision {
+		// Only "auto" gets here with images, all in earlier turns, when the newest message is code or math.
+		body.Messages = withoutImages(body.Messages)
 	}
 	body.Model = m.ID
 	payload, err := json.Marshal(upstreamRequest{chatRequest: body, ReasoningEffort: m.ReasoningEffort})

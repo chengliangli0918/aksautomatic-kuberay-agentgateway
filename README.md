@@ -5,10 +5,10 @@ authentication, request limits, daily token quotas, and daily chargeback budgets
 
 It serves three models with **smart routing**: callers send `"model": "auto"`,
 and the quota proxy picks a model for each request before charging quota.
-Images go to Qwen3.5-4B. For text, a small CPU decision model, the **smart
-router**, sends coding and math prompts to gpt-oss-120b and simple prompts to
-the cheaper gpt-oss-20b. Callers can also choose a model by name. See
-[Model routing](#model-routing).
+A message with an image goes to Qwen3.5-4B. For text, a small CPU decision
+model, the **smart router**, sends coding and math prompts to gpt-oss-120b and
+simple prompts to the cheaper gpt-oss-20b. Callers can also choose a model by
+name. See [Model routing](#model-routing).
 
 ![POC architecture: callers reach agentgateway over public HTTPS; the quota proxy enforces per-caller limits and picks a model with a CPU model router before Ray Serve routes requests to three models on one 8xA100 node](docs/architecture.svg)
 
@@ -204,12 +204,23 @@ Callers that send `"model": "auto"` let the quota proxy choose the model for
 each request, before it reserves quota, because the charge depends on the
 model. Explicit model IDs skip routing.
 
-1. Any image in the request → `qwen3.5-4b` (`image`), the only vision model.
-   gpt-oss models cannot read images, so image questions don't get the
-   strongest model.
+1. An image in the newest user message → `qwen3.5-4b` (`image`), the only
+   vision model. gpt-oss models cannot read images, so a question that comes
+   with an image doesn't get the strongest model, even if it is about code.
 2. Otherwise a small **decision model**, the `model-router` service in
    [`router/`](router/), labels the text `simple`, `code`, or `math`:
-   `code` and `math` go to `gpt-oss-120b`, `simple` to `gpt-oss-20b`.
+   `code` and `math` go to `gpt-oss-120b`, `simple` to `gpt-oss-20b`. The one
+   exception is `simple` text in a conversation with an earlier image: it stays
+   on `qwen3.5-4b` (`image`), so a follow-up such as "What color is it?" still
+   sees the picture.
+
+Chat clients resend earlier turns, so an image from a few messages ago stays in
+the request. It does not pull code and math questions to the vision model:
+they go to `gpt-oss-120b`, which receives the conversation with each earlier
+image replaced by the note `[image omitted: this model cannot read images]`.
+The vision model's earlier replies stay in it, but a coding question that
+depends on the picture itself must carry the image in the same message. The
+audit log records the images the caller sent, not the ones forwarded.
 
 The router embeds the newest user message with
 [`BAAI/bge-small-en-v1.5`](https://huggingface.co/BAAI/bge-small-en-v1.5)

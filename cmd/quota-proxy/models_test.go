@@ -20,8 +20,11 @@ import (
 func TestRouteAuto(t *testing.T) {
 	user := func(text string) message { return message{Role: "user", Content: content{text: text}} }
 	assistant := func(text string) message { return message{Role: "assistant", Content: content{text: text}} }
-	withImage := message{Role: "user", Content: content{parts: []contentPart{
-		{Type: "image_url", ImageURL: &imageURL{URL: "data:image/png;base64,"}}, {Type: "text", Text: "What is this?"}}}}
+	imageWith := func(text string) message {
+		return message{Role: "user", Content: content{parts: []contentPart{
+			{Type: "image_url", ImageURL: &imageURL{URL: "data:image/png;base64,"}}, {Type: "text", Text: text}}}}
+	}
+	withImage := imageWith("What is this?")
 	for _, tc := range []struct {
 		name          string
 		messages      []message
@@ -47,13 +50,39 @@ func TestRouteAuto(t *testing.T) {
 		{"older code ignored", []message{user("Write code to sort a list in Python."), assistant("Done."),
 			user("Thanks! What is the capital of France?")}, cheapModel, "simple"},
 		{"image", []message{withImage}, visionModel, "image"},
+		// Only the vision model can read the image that comes with the question.
+		{"image with code question", []message{imageWith("Write Python code to reverse a linked list.")}, visionModel, "image"},
 		{"earlier image", []message{withImage, assistant("A cat."), user("What color is it?")}, visionModel, "image"},
+		{"earlier image, code", []message{withImage, assistant("A cat."),
+			user("Write Python code to reverse a linked list.")}, strongModel, "code"},
+		{"earlier image, math", []message{withImage, assistant("A cat."), user("Solve 2x + 3 = 11 for x.")}, strongModel, "math"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if m, reason := routeByRules(tc.messages); m.ID != tc.model || reason != tc.reason {
 				t.Fatalf("routed to %s (%s), want %s (%s)", m.ID, reason, tc.model, tc.reason)
 			}
 		})
+	}
+}
+
+func TestWithoutImages(t *testing.T) {
+	photo := contentPart{Type: "image_url", ImageURL: &imageURL{URL: "data:image/png;base64,"}}
+	messages := []message{
+		{Role: "user", Content: content{parts: []contentPart{photo, {Type: "text", Text: "What is this?"}}}},
+		{Role: "assistant", Content: content{text: "A cat."}},
+		{Role: "user", Content: content{parts: []contentPart{photo}}},
+		{Role: "assistant", Content: content{text: "Another cat."}},
+		{Role: "user", Content: content{text: "Thanks."}},
+	}
+	want := []string{imageOmitted + "\nWhat is this?", "A cat.", imageOmitted, "Another cat.", "Thanks."}
+	got := withoutImages(messages)
+	for i, m := range got {
+		if m.Content.parts != nil || m.Content.text != want[i] {
+			t.Fatalf("message %d is %+v, want text %q", i, m.Content, want[i])
+		}
+	}
+	if !hasImages(messages) {
+		t.Fatal("the caller's messages were changed; the audit log counts their images")
 	}
 }
 
@@ -72,6 +101,8 @@ func TestModelRouter(t *testing.T) {
 			http.Error(w, "unavailable", http.StatusInternalServerError)
 		case "unknown":
 			io.WriteString(w, `{"label":"poetry"}`)
+		case "simple":
+			io.WriteString(w, `{"label":"simple"}`)
 		case "slow":
 			time.Sleep(200 * time.Millisecond)
 		default:
@@ -97,6 +128,8 @@ func TestModelRouter(t *testing.T) {
 		{"unknown label", []message{user("unknown")}, cheapModel, "simple", "rules", 1},
 		{"timeout", []message{user("slow")}, cheapModel, "simple", "rules", 1},
 		{"images skip the router", []message{withImage}, visionModel, "image", "rules", 0},
+		{"earlier image, router says math", []message{withImage, assistant("A cat."), user("Say hello.")}, strongModel, "math", "model", 1},
+		{"earlier image, router says simple", []message{withImage, assistant("A cat."), user("simple")}, visionModel, "image", "model", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before := calls.Load()
@@ -130,6 +163,9 @@ func TestModelSelectionAndPricing(t *testing.T) {
 		return `{"model":"` + model + `","messages":[{"role":"user","content":` + content + `}],"max_tokens":4096}`
 	}
 	imageContent := `[{"type":"image_url","image_url":{"url":"` + img + `"}},{"type":"text","text":"Describe it."}]`
+	afterImage := `{"model":"auto","max_tokens":4096,"messages":[{"role":"user","content":` + imageContent + `},` +
+		`{"role":"assistant","content":"A gray square."},` +
+		`{"role":"user","content":"Write a Python function to merge two sorted lists."}]}`
 	for _, tc := range []struct {
 		name, body, model, reason, effort string
 		status                            int
@@ -138,6 +174,7 @@ func TestModelSelectionAndPricing(t *testing.T) {
 		{"auto simple", chat("auto", `"Say hello."`), cheapModel, "simple", "low", 200, 1},
 		{"auto code", chat("auto", `"Write a Python function to merge two sorted lists."`), strongModel, "code", "medium", 200, 3},
 		{"auto image", chat("auto", imageContent), visionModel, "image", "", 200, 1},
+		{"auto code after an image", afterImage, strongModel, "code", "medium", 200, 3},
 		{"explicit model", chat(strongModel, `"Say hello."`), strongModel, "requested", "medium", 200, 3},
 		{"image to text-only model", chat(cheapModel, imageContent), "", "", "", 400, 0},
 		{"output above cap", strings.Replace(chat("auto", `"Hi"`), "4096", "4097", 1), "", "", "", 400, 0},
@@ -170,6 +207,9 @@ func TestModelSelectionAndPricing(t *testing.T) {
 			if sent["model"] != tc.model || effort != tc.effort {
 				t.Fatalf("forwarded model=%v reasoning_effort=%q, want %s %q", sent["model"], effort, tc.model, tc.effort)
 			}
+			if tc.model != visionModel && bytes.Contains(forwarded.Load().([]byte), []byte("image_url")) {
+				t.Fatalf("text-only model received an image: %.300s", forwarded.Load())
+			}
 			charge := contextTokens * c.TokenPriceMicrousd * tc.multiplier
 			if w.Header().Get("X-Routed-Model") != tc.model || w.Header().Get("X-Route-Reason") != tc.reason ||
 				w.Header().Get("X-Quota-Reserved-Microusd") != strconv.FormatInt(charge, 10) {
@@ -189,6 +229,10 @@ func TestModelSelectionAndPricing(t *testing.T) {
 				a.RouteSource != wantSource || w.Header().Get("X-Route-Source") != wantSource ||
 				a.PriceMultiplier != tc.multiplier || a.ChargeMicrousd != charge {
 				t.Fatalf("audit routing fields: %+v", a)
+			}
+			// The audit records the request as the caller sent it, even when images are left out.
+			if want := strings.Count(tc.body, `"type":"image_url"`); a.ImageCount != want {
+				t.Fatalf("audited %d images, want %d", a.ImageCount, want)
 			}
 		})
 	}

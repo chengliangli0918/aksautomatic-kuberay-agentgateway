@@ -122,9 +122,11 @@ with st.sidebar:
     with st.expander("How model smart routing works", icon=":material/alt_route:"):
         st.markdown(
             "With **auto**, the gateway picks a model for each message before it reserves quota:\n"
-            "- **Images** go to the vision model, `qwen3.5-4b`.\n"
+            "- **Images** go to the vision model, `qwen3.5-4b`, and so do simple follow-ups in a conversation "
+            "that has an image.\n"
             "- **Text** is labeled *simple*, *code*, or *math* by a small CPU decision model that reads your "
-            "message and the previous reply. Code and math go to `gpt-oss-120b` (3× price); simple messages "
+            "message and the previous reply. Code and math go to `gpt-oss-120b` (3× price), even after an "
+            "image; it can't read images, so earlier ones are replaced by a note. Simple messages "
             "go to `gpt-oss-20b`.\n"
             "- If the decision model is unavailable, keyword rules decide.\n\n"
             "Each reply shows the model and why, such as *gpt-oss-120b (code)*. Choose a model by name to "

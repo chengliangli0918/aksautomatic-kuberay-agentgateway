@@ -107,6 +107,43 @@ func hasImages(messages []message) bool {
 	return false
 }
 
+// newestUserHasImages reports whether the image belongs to the question being asked now,
+// rather than to an earlier turn that the caller resends as history.
+func newestUserHasImages(messages []message) bool {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			return hasImages(messages[i : i+1])
+		}
+	}
+	return false
+}
+
+const imageOmitted = "[image omitted: this model cannot read images]"
+
+// withoutImages replaces every image with a short note, for models that cannot read images.
+// It copies what it changes, because the audit log records the caller's own messages.
+func withoutImages(messages []message) []message {
+	if !hasImages(messages) {
+		return messages
+	}
+	out := make([]message, len(messages))
+	for i, m := range messages {
+		out[i] = m
+		if !hasImages(messages[i : i+1]) {
+			continue
+		}
+		texts := make([]string, len(m.Content.parts))
+		for j, p := range m.Content.parts {
+			texts[j] = p.Text
+			if p.Type == "image_url" {
+				texts[j] = imageOmitted
+			}
+		}
+		out[i].Content = content{text: strings.Join(texts, "\n")}
+	}
+	return out
+}
+
 // routingTexts returns the newest user message and the reply before it, if any, so follow-ups
 // to a coding or math answer can stay on the strong model.
 func routingTexts(messages []message) (user, previous string) {
@@ -124,18 +161,27 @@ func routingTexts(messages []message) (user, previous string) {
 
 // routeByRules picks a model for an "auto" request with keyword and syntax checks.
 func routeByRules(messages []message) (modelSpec, string) {
-	if hasImages(messages) {
-		return models[visionModel], "image"
-	}
 	user, previous := routingTexts(messages)
 	text := user + "\n" + previous
+	label := "simple"
 	switch {
 	case codePattern.MatchString(text):
-		return models[strongModel], "code"
+		label = "code"
 	case mathPattern.MatchString(text):
-		return models[strongModel], "math"
+		label = "math"
 	}
-	return models[cheapModel], "simple"
+	return routeLabel(messages, label)
+}
+
+// routeLabel selects the model for a text label. An image in the newest user message needs the
+// only vision model. An earlier image keeps a simple follow-up, such as "What color is it?", on
+// the vision model, but code and math still go to the strong model, which gets the earlier
+// images as a note (see withoutImages) instead of failing on them.
+func routeLabel(messages []message, label string) (modelSpec, string) {
+	if newestUserHasImages(messages) || (label == "simple" && hasImages(messages)) {
+		return models[visionModel], "image"
+	}
+	return models[routerModels[label]], label
 }
 
 // The router's labels and the models they select.
@@ -199,15 +245,17 @@ func (p *promptRouter) classify(ctx context.Context, text, previous string) (str
 	return out.Label, nil
 }
 
-// route picks a model for an "auto" request and returns why and what decided. Images need the
-// only vision model. Otherwise the model router classifies the text; if it is not configured
-// or fails, the keyword rules decide.
+// route picks a model for an "auto" request and returns why and what decided. An image in the
+// newest user message needs the only vision model. Otherwise the model router classifies the
+// text; if it is not configured or fails, the keyword rules decide. Earlier images only matter
+// for simple text; see routeLabel.
 func (s *service) route(ctx context.Context, messages []message) (modelSpec, string, string) {
-	if s.router != nil && !hasImages(messages) {
+	if s.router != nil && !newestUserHasImages(messages) {
 		user, previous := routingTexts(messages)
 		label, err := s.router.classify(ctx, user, previous)
 		if err == nil {
-			return models[routerModels[label]], label, "model"
+			m, reason := routeLabel(messages, label)
+			return m, reason, "model"
 		}
 		log.Printf("model router failed, using keyword rules: %v", err)
 	}
